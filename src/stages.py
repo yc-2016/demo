@@ -25,8 +25,11 @@ STAGES: list[dict] = [
      "visibility": "exterior",
      "hint": "看筏板/承台、地下室墙体顶板、地下层数"},
     {"id": "structure", "name": "主体结构（楼板/柱/剪力墙）", "weight": 35,
-     "visibility": "exterior",
-     "hint": "数楼层数、看模板支撑、钢筋绑扎、混凝土浇筑面、爬模/铝模"},
+     "visibility": "exterior", "metric": "count", "unit": "层",
+     # count_total 填该建筑主体结构的总层数（从图纸或合同工期表拿）；
+     # 留空则用模型估计值，但模型估的总层数会在 32~35 之间飘，只能做参考。
+     "count_total": 32,   # TNB 项目：按首期观测估计，实际应用请填图纸总层数
+     "hint": "数各塔楼已封顶的楼层数；看模板支撑、钢筋绑扎、混凝土浇筑面"},
     {"id": "masonry", "name": "砌体与二次结构", "weight": 10,
      "visibility": "interior",
      "hint": "看填充墙、构造柱、过梁、圈梁"},
@@ -52,19 +55,70 @@ def total_weight() -> int:
     return sum(s["weight"] for s in STAGES)
 
 
+def _count_factor(item: dict, cfg: dict) -> tuple[float | None, dict]:
+    """
+    计数型工序的折算：优先用"已封顶层数 / 总层数"，没有计数再退回状态四档。
+
+    关键取舍：不用模型给的 count.done（它取的是各塔最小值，而最慢那栋的
+    计数往往不稳定——实测 11→11→9，不升反降），改为从 count_detail
+    自己算，并取【最高塔】的封顶层数作为进度指示。
+    理由：最高塔的楼层计数在各期照片间最稳定（实测 16→18→20，每月 +2 层）。
+
+    同时输出最高/最低/平均三个口径，便于发现"各塔进度不均"。
+    """
+    detail = [d for d in (item.get("count_detail") or []) if isinstance(d, dict)]
+    per_tower = [float(d["done"]) for d in detail
+                 if isinstance(d.get("done"), (int, float))]
+    cnt = item.get("count") or {}
+    model_done = cnt.get("done")
+    model_total = cnt.get("total")
+    model_inc = cnt.get("inc")
+
+    if per_tower:
+        done_max = max(per_tower)
+        done_min = min(per_tower)
+        done_avg = sum(per_tower) / len(per_tower)
+        total = cfg.get("count_total") or model_total or done_max
+        factor = max(0.0, min(1.0, done_max / float(total))) if total else None
+        return factor, {
+            "factor_source": "count",
+            "count_done": int(done_max),
+            "count_min": int(done_min),
+            "count_avg": round(done_avg, 1),
+            "count_total": total,
+            "count_inc": model_inc,
+            "count_is_estimated": cfg.get("count_total") is None,
+        }
+
+    if isinstance(model_done, (int, float)) and isinstance(model_total, (int, float)) \
+            and model_total > 0:
+        # 配置里的总层数优先于模型估计值（模型估的总层数误差很大）
+        total = cfg.get("count_total") or model_total
+        factor = max(0.0, min(1.0, model_done / float(total)))
+        return factor, {"factor_source": "count", "count_done": model_done,
+                        "count_min": model_done, "count_avg": model_done,
+                        "count_total": total, "count_inc": model_inc,
+                        "count_is_estimated": cfg.get("count_total") is None}
+
+    status = str(item.get("status", "unclear")).lower()
+    factor = STATUS_FACTOR.get(status)
+    return factor, ({"factor_source": "status"} if factor is not None else {})
+
+
 def compute_progress(vlm_stages: list[dict]) -> dict:
     """
-    把模型给出的工序状态折算成加权进度。
-    模型只负责"判断有没有看到"，算术由代码做——不让模型直接报百分比。
+    把模型给出的工序判定折算成加权进度。
+    模型只负责"看到什么"，算术由代码做——不让模型直接报百分比。
 
     同时给出两个数，避免"分母变了进度就跳"的错觉：
-      progress_pct   — 只在可分判断的工序里算（乐观口径，回答"做的部分做到了几成"）
-      progress_floor — 分母用全部权重，看不清按 0 计（保守口径，回答"整体至少完成了几成"）
+      progress_pct   — 只在可判断的工序里算（乐观口径）
+      progress_floor — 分母用全部权重，看不清按 0 计（保守口径）
+
+    计数型工序（如主体结构）按"已封顶层数/总层数"折算，比四档状态有分辨率。
     """
     by_id = {s["id"]: s for s in STAGES}
     counted = 0.0
     total_w = 0.0
-    all_w = 0.0
     detail = []
     for item in vlm_stages:
         sid = item.get("id")
@@ -72,17 +126,20 @@ def compute_progress(vlm_stages: list[dict]) -> dict:
         if not cfg:
             continue
         status = str(item.get("status", "unclear")).lower()
-        factor = STATUS_FACTOR.get(status)
-        all_w += cfg["weight"]
+        if cfg.get("metric") == "count":
+            factor, extra = _count_factor(item, cfg)
+        else:
+            factor = STATUS_FACTOR.get(status)
+            extra = {"factor_source": "status"} if factor is not None else {}
+
+        base = {**item, "name": cfg["name"], "weight": cfg["weight"],
+                "visibility": cfg["visibility"], **extra}
         if factor is None:
-            detail.append({**item, "name": cfg["name"], "weight": cfg["weight"],
-                           "visibility": cfg["visibility"], "counted": False})
+            detail.append({**base, "counted": False})
             continue
         counted += cfg["weight"] * factor
         total_w += cfg["weight"]
-        detail.append({**item, "name": cfg["name"], "weight": cfg["weight"],
-                       "visibility": cfg["visibility"], "factor": factor,
-                       "counted": True})
+        detail.append({**base, "factor": round(factor, 4), "counted": True})
 
     tw = total_weight()
     return {

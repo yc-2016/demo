@@ -248,6 +248,7 @@ def compare_photos(before_path: str, after_path: str, out_dir: str,
         "ssim_heatmap": save("05_ssim_heatmap", heat),
         "diff_outlined": save("06_diff_outlined", outlined),
         "change_grid": save("07_change_grid", grid),
+        "change_mask": save("09_change_mask", cv2.cvtColor(dissim, cv2.COLOR_GRAY2RGB)),
     }
     if novel_img is not None:
         paths["new_structure"] = save("08_new_structure", novel_img)
